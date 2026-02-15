@@ -17,10 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantJect-Core")
 
-NODE_POOL = [
-    "https://sentry.exchange.grpc-web.injective.network",
-    "https://k8s.global.mainnet.chronos.grpc-web.injective.network",
-]
+REST_NODE = "https://api.exchange.injective.network"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -39,16 +36,19 @@ class DataCoordinator:
         self.client: httpx.AsyncClient | None = None
 
     async def _resolve_market_id(self, ticker: str) -> str:
-        url = "https://api.exchange.injective.network/api/exchange/v1/spot/markets"
-        r = await self.client.get(url)
+        r = await self.client.get(
+            f"{REST_NODE}/api/exchange/v1/spot/markets"
+        )
         if r.status_code != 200:
             raise IOError("Failed to fetch markets")
+
         markets = r.json().get("markets", [])
         t = ticker.upper()
+
         for m in markets:
-            symbol = m.get("ticker", "").upper()
-            if symbol.startswith(t):
+            if m.get("ticker", "").upper().startswith(t):
                 return m["marketId"]
+
         raise IOError("Market not found")
 
     async def get_market_data(
@@ -123,48 +123,27 @@ class DataCoordinator:
     async def _fetch_market_history(self, ticker, days) -> pd.Series:
         market_id = await self._resolve_market_id(ticker)
 
-        end_time = int(time.time())
-        start_time = end_time - (days * 86400)
+        url = f"{REST_NODE}/api/exchange/v1/spot/markets/{market_id}/candles"
 
-        params = {
-            "marketID": market_id,
-            "resolution": "1440",
-            "from": start_time,
-            "to": end_time,
-        }
+        r = await self.client.get(
+            url,
+            params={
+                "interval": "1d",
+                "limit": days,
+            },
+        )
 
-        last_error = None
+        if r.status_code != 200:
+            raise IOError(f"REST error {r.status_code}")
 
-        for node in NODE_POOL:
-            try:
-                url = f"{node}/api/chronos/v1/market/history"
-                r = await self.client.get(url, params=params)
+        candles = r.json().get("data", [])
 
-                if r.status_code != 200:
-                    last_error = f"{node} -> {r.status_code}"
-                    continue
+        if not candles:
+            raise IOError("No candles")
 
-                raw = r.json()
+        closes = [float(c["close"]) for c in candles]
 
-                if isinstance(raw, dict):
-                    hist = raw.get("history", [])
-                elif isinstance(raw, list) and raw:
-                    hist = raw[0].get("history", [])
-                else:
-                    hist = []
-
-                if not hist:
-                    last_error = f"{node} -> empty history"
-                    continue
-
-                closes = [float(x["c"]) for x in hist]
-                return pd.Series(closes)
-
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-        raise IOError(last_error or "All nodes failed")
+        return pd.Series(closes)
 
 
 coordinator = DataCoordinator()
@@ -173,7 +152,7 @@ coordinator = DataCoordinator()
 async def startup_sequence():
     logger.info("Starting QuantJect...")
     coordinator.client = httpx.AsyncClient(
-        timeout=12.0,
+        timeout=15.0,
         headers=HEADERS,
     )
     try:
@@ -183,30 +162,16 @@ async def startup_sequence():
         logger.info("Startup warming skipped.")
 
 
-async def warming_loop():
-    while True:
-        try:
-            await asyncio.gather(
-                coordinator._background_refresh("INJ", 30, "INJ_30"),
-                coordinator._background_refresh("BTC", 30, "BTC_30"),
-            )
-        except Exception:
-            pass
-        await asyncio.sleep(15)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await startup_sequence()
-    task = asyncio.create_task(warming_loop())
     yield
-    task.cancel()
     await coordinator.client.aclose()
 
 
 app = FastAPI(
     title="QuantJect Institutional API",
-    version="8.0.0",
+    version="9.0.0",
     lifespan=lifespan,
 )
 
