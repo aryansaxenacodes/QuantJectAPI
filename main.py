@@ -11,11 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [QuantJect] - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("QuantJect-Core")
+
 
 NODE_POOL = [
     "https://sentry.exchange.grpc-web.injective.network",
@@ -37,6 +39,12 @@ HEADERS = {
 TTL_FRESH_SECONDS = 10
 TTL_SOFT_STALE_SECONDS = 45
 
+SAFE_MAX_TS = 1740000000
+
+
+def safe_now() -> int:
+    return min(int(time.time()), SAFE_MAX_TS)
+
 
 class DataCoordinator:
     def __init__(self):
@@ -53,7 +61,7 @@ class DataCoordinator:
     ) -> Tuple[pd.Series, str]:
 
         key = f"{ticker}_{days}"
-        now = time.time()
+        now = safe_now()
 
         if key in self.cache:
             entry = self.cache[key]
@@ -86,7 +94,7 @@ class DataCoordinator:
             async with self.lock:
                 self.cache[key] = {
                     "data": data,
-                    "ts": time.time(),
+                    "ts": safe_now(),
                     "updating": False,
                 }
 
@@ -106,7 +114,7 @@ class DataCoordinator:
             async with self.lock:
                 self.cache[key] = {
                     "data": data,
-                    "ts": time.time(),
+                    "ts": safe_now(),
                     "updating": False,
                 }
             logger.info(f"Background refresh success: {ticker}")
@@ -117,7 +125,7 @@ class DataCoordinator:
     async def _fetch_market_history(self, ticker, days) -> pd.Series:
         market_id = MARKET_MAP.get(ticker.upper(), MARKET_MAP["INJ"])
 
-        end_time = int(time.time())
+        end_time = safe_now() - 86400
         start_time = end_time - (days * 86400)
 
         params = {
@@ -132,6 +140,7 @@ class DataCoordinator:
         for node in NODE_POOL:
             try:
                 url = f"{node}/api/chronos/v1/market/history"
+
                 r = await self.client.get(url, params=params)
 
                 if r.status_code != 200:
@@ -156,7 +165,6 @@ class DataCoordinator:
 
             except Exception as e:
                 last_error = str(e)
-                continue
 
         raise IOError(last_error or "All nodes failed")
 
@@ -166,15 +174,17 @@ coordinator = DataCoordinator()
 
 async def startup_sequence():
     logger.info("Starting QuantJect...")
+
     coordinator.client = httpx.AsyncClient(
-        timeout=12.0,
+        timeout=12,
         headers=HEADERS,
     )
+
     try:
         await coordinator._background_refresh("INJ", 30, "INJ_30")
         logger.info("Initial cache warmed.")
     except Exception:
-        logger.info("Startup warming skipped.")
+        logger.info("Startup warm skipped.")
 
 
 async def warming_loop():
@@ -200,7 +210,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantJect Institutional API",
-    version="7.0.0",
+    version="8.0.0",
     lifespan=lifespan,
 )
 
@@ -230,6 +240,7 @@ async def get_volatility(
     ticker: str = "INJ",
     days: int = 30,
 ):
+
     t0 = time.time()
 
     closes, status = await coordinator.get_market_data(
@@ -251,7 +262,7 @@ async def get_volatility(
         "meta": {
             "status": status,
             "latency_ms": int((time.time() - t0) * 1000),
-            "timestamp_unix": time.time(),
+            "timestamp_unix": safe_now(),
         },
     }
 
