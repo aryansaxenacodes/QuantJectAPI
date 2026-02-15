@@ -11,25 +11,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [QuantJect] - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("QuantJect-Core")
 
-
 NODE_POOL = [
     "https://sentry.exchange.grpc-web.injective.network",
     "https://k8s.global.mainnet.chronos.grpc-web.injective.network",
 ]
-
-MARKET_MAP = {
-    "INJ": "0xa508cb32923323679f29a032c70342c147c17d0145625922b0ef84e951c8440a",
-    "BTC": "0x4ca0f92fc28be0c9761326016b5a1a2177dd6375558365116b5bdda9abc229ce",
-    "ETH": "0x90e66cb9159ac39dc3692d43e2621db383d47f9a888c7a6e76860d7031201550",
-    "SOL": "0xd32398d57529452b4755a7114e9f5ee667954b60e6118db0d33e506691c9533f",
-}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -39,12 +30,6 @@ HEADERS = {
 TTL_FRESH_SECONDS = 10
 TTL_SOFT_STALE_SECONDS = 45
 
-SAFE_MAX_TS = 1740000000
-
-
-def safe_now() -> int:
-    return min(int(time.time()), SAFE_MAX_TS)
-
 
 class DataCoordinator:
     def __init__(self):
@@ -52,6 +37,19 @@ class DataCoordinator:
         self.flights: Dict[str, asyncio.Event] = {}
         self.lock = asyncio.Lock()
         self.client: httpx.AsyncClient | None = None
+
+    async def _resolve_market_id(self, ticker: str) -> str:
+        url = "https://api.exchange.injective.network/api/exchange/v1/spot/markets"
+        r = await self.client.get(url)
+        if r.status_code != 200:
+            raise IOError("Failed to fetch markets")
+        markets = r.json().get("markets", [])
+        t = ticker.upper()
+        for m in markets:
+            symbol = m.get("ticker", "").upper()
+            if symbol.startswith(t):
+                return m["marketId"]
+        raise IOError("Market not found")
 
     async def get_market_data(
         self,
@@ -61,7 +59,7 @@ class DataCoordinator:
     ) -> Tuple[pd.Series, str]:
 
         key = f"{ticker}_{days}"
-        now = safe_now()
+        now = time.time()
 
         if key in self.cache:
             entry = self.cache[key]
@@ -94,7 +92,7 @@ class DataCoordinator:
             async with self.lock:
                 self.cache[key] = {
                     "data": data,
-                    "ts": safe_now(),
+                    "ts": time.time(),
                     "updating": False,
                 }
 
@@ -114,7 +112,7 @@ class DataCoordinator:
             async with self.lock:
                 self.cache[key] = {
                     "data": data,
-                    "ts": safe_now(),
+                    "ts": time.time(),
                     "updating": False,
                 }
             logger.info(f"Background refresh success: {ticker}")
@@ -123,9 +121,9 @@ class DataCoordinator:
                 self.cache[key]["updating"] = False
 
     async def _fetch_market_history(self, ticker, days) -> pd.Series:
-        market_id = MARKET_MAP.get(ticker.upper(), MARKET_MAP["INJ"])
+        market_id = await self._resolve_market_id(ticker)
 
-        end_time = safe_now() - 86400
+        end_time = int(time.time())
         start_time = end_time - (days * 86400)
 
         params = {
@@ -140,7 +138,6 @@ class DataCoordinator:
         for node in NODE_POOL:
             try:
                 url = f"{node}/api/chronos/v1/market/history"
-
                 r = await self.client.get(url, params=params)
 
                 if r.status_code != 200:
@@ -165,6 +162,7 @@ class DataCoordinator:
 
             except Exception as e:
                 last_error = str(e)
+                continue
 
         raise IOError(last_error or "All nodes failed")
 
@@ -174,17 +172,15 @@ coordinator = DataCoordinator()
 
 async def startup_sequence():
     logger.info("Starting QuantJect...")
-
     coordinator.client = httpx.AsyncClient(
-        timeout=12,
+        timeout=12.0,
         headers=HEADERS,
     )
-
     try:
         await coordinator._background_refresh("INJ", 30, "INJ_30")
         logger.info("Initial cache warmed.")
     except Exception:
-        logger.info("Startup warm skipped.")
+        logger.info("Startup warming skipped.")
 
 
 async def warming_loop():
@@ -240,7 +236,6 @@ async def get_volatility(
     ticker: str = "INJ",
     days: int = 30,
 ):
-
     t0 = time.time()
 
     closes, status = await coordinator.get_market_data(
@@ -262,7 +257,7 @@ async def get_volatility(
         "meta": {
             "status": status,
             "latency_ms": int((time.time() - t0) * 1000),
-            "timestamp_unix": safe_now(),
+            "timestamp_unix": time.time(),
         },
     }
 
