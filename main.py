@@ -18,14 +18,13 @@ logging.basicConfig(
 logger = logging.getLogger("QuantJect-Core")
 
 INJECTIVE_REST = "https://api.exchange.injective.network"
+LCD_INDEXER = "https://lcd.injective.network"
 COINGECKO = "https://api.coingecko.com/api/v3"
 
-MARKET_MAP = {
-    "INJ": "0xa508cb32923323679f29a032c70342c147c17d0145625922b0ef84e951c8440a",
-    "BTC": "0x4ca0f92fc28be0c9761326016b5a1a2177dd6375558365116b5bdda9abc229ce",
-    "ETH": "0x90e66cb9159ac39dc3692d43e2621db383d47f9a888c7a6e76860d7031201550",
-    "SOL": "0xd32398d57529452b4755a7114e9f5ee667954b60e6118db0d33e506691c9533f",
-}
+CHRONOS_POOL = [
+    "https://sentry.exchange.grpc-web.injective.network",
+    "https://k8s.global.mainnet.chronos.grpc-web.injective.network",
+]
 
 COIN_MAP = {
     "INJ": "injective-protocol",
@@ -46,6 +45,27 @@ class DataCoordinator:
         self.flights = {}
         self.lock = asyncio.Lock()
         self.client = None
+        self.market_map = {}
+
+    async def resolve_markets(self):
+        try:
+            r = await self.client.get(
+                f"{INJECTIVE_REST}/api/exchange/v1/spot/markets"
+            )
+            if r.status_code != 200:
+                return
+            raw = r.json()
+            markets = raw.get("markets", [])
+            for m in markets:
+                ticker = m.get("ticker", "")
+                market_id = m.get("marketId")
+                if not ticker or not market_id:
+                    continue
+                base = ticker.split("/")[0]
+                if base in ["INJ", "BTC", "ETH", "SOL"]:
+                    self.market_map[base] = market_id
+        except Exception:
+            pass
 
     async def get_market_data(self, ticker, days, bg_tasks):
         key = f"{ticker}_{days}"
@@ -73,7 +93,11 @@ class DataCoordinator:
         try:
             data = await self._fetch_market_history(ticker, days)
             async with self.lock:
-                self.cache[key] = {"data": data, "ts": time.time(), "updating": False}
+                self.cache[key] = {
+                    "data": data,
+                    "ts": time.time(),
+                    "updating": False,
+                }
             return data, "NETWORK_FETCH"
         except Exception as e:
             logger.error(f"Fetch failed: {e}")
@@ -86,44 +110,128 @@ class DataCoordinator:
         try:
             data = await self._fetch_market_history(ticker, days)
             async with self.lock:
-                self.cache[key] = {"data": data, "ts": time.time(), "updating": False}
+                self.cache[key] = {
+                    "data": data,
+                    "ts": time.time(),
+                    "updating": False,
+                }
         except Exception:
             if key in self.cache:
                 self.cache[key]["updating"] = False
 
-    async def _fetch_injective_rest(self, ticker, days):
-        market_id = MARKET_MAP[ticker]
-        url = f"{INJECTIVE_REST}/api/exchange/v1/spot/markets/{market_id}/candles"
-        r = await self.client.get(url, params={"interval": "1d", "limit": days})
+    async def _layer_exchange_rest(self, ticker, days):
+        market_id = self.market_map.get(ticker)
+        if not market_id:
+            raise IOError("market not resolved")
+
+        r = await self.client.get(
+            f"{INJECTIVE_REST}/api/exchange/v1/spot/markets/{market_id}/candles",
+            params={"interval": "1d", "limit": days},
+        )
+
         if r.status_code != 200:
-            raise IOError("injective rest failed")
-        data = r.json().get("data", [])
-        if not data:
+            raise IOError("exchange rest failed")
+
+        raw = r.json()
+        candles = raw.get("candles", []) or raw.get("data", [])
+
+        if not candles:
             raise IOError("empty candles")
-        closes = [float(c["close"]) for c in data]
+
+        closes = [float(x["close"]) for x in candles]
         return pd.Series(closes)
 
-    async def _fetch_coingecko(self, ticker, days):
-        coin = COIN_MAP[ticker]
+    async def _layer_lcd(self, ticker, days):
+        market_id = self.market_map.get(ticker)
+        if not market_id:
+            raise IOError("market not resolved")
+
+        r = await self.client.get(
+            f"{LCD_INDEXER}/injective/exchange/v1beta1/spot/markets/{market_id}/candles"
+        )
+
+        if r.status_code != 200:
+            raise IOError("lcd failed")
+
+        raw = r.json()
+        candles = raw.get("candles", [])
+
+        if not candles:
+            raise IOError("empty lcd")
+
+        closes = [float(x["close"]) for x in candles][-days:]
+        return pd.Series(closes)
+
+    async def _layer_chronos(self, ticker, days):
+        market_id = self.market_map.get(ticker)
+        if not market_id:
+            raise IOError("market not resolved")
+
+        end_time = int(time.time())
+        start_time = end_time - days * 86400
+
+        params = {
+            "marketID": market_id,
+            "resolution": "1440",
+            "from": start_time,
+            "to": end_time,
+        }
+
+        for node in CHRONOS_POOL:
+            r = await self.client.get(
+                f"{node}/api/chronos/v1/market/history",
+                params=params,
+            )
+            if r.status_code != 200:
+                continue
+
+            raw = r.json()
+            hist = raw.get("history", [])
+
+            if not hist:
+                continue
+
+            closes = [float(x["c"]) for x in hist]
+            return pd.Series(closes)
+
+        raise IOError("chronos failed")
+
+    async def _layer_coingecko(self, ticker, days):
+        coin = COIN_MAP.get(ticker.upper(), "injective-protocol")
+
         r = await self.client.get(
             f"{COINGECKO}/coins/{coin}/ohlc",
             params={"vs_currency": "usd", "days": days},
         )
+
         if r.status_code != 200:
             raise IOError("coingecko failed")
-        data = r.json()
-        closes = [float(x[4]) for x in data]
+
+        raw = r.json()
+        if not raw:
+            raise IOError("empty coingecko")
+
+        closes = [float(x[4]) for x in raw]
         return pd.Series(closes)
 
     async def _fetch_market_history(self, ticker, days):
-        ticker = ticker.upper()
+        try:
+            return await self._layer_exchange_rest(ticker, days)
+        except Exception:
+            logger.info("Injective Exchange REST failed")
 
         try:
-            return await self._fetch_injective_rest(ticker, days)
+            return await self._layer_lcd(ticker, days)
         except Exception:
-            logger.info("Injective REST failed, fallback CoinGecko")
+            logger.info("Injective LCD failed")
 
-        return await self._fetch_coingecko(ticker, days)
+        try:
+            return await self._layer_chronos(ticker, days)
+        except Exception:
+            logger.info("Chronos failed")
+
+        logger.info("Fallback CoinGecko")
+        return await self._layer_coingecko(ticker, days)
 
 
 coordinator = DataCoordinator()
@@ -131,7 +239,11 @@ coordinator = DataCoordinator()
 
 async def startup_sequence():
     logger.info("Starting QuantJect...")
-    coordinator.client = httpx.AsyncClient(timeout=15.0, headers=HEADERS)
+    coordinator.client = httpx.AsyncClient(
+        timeout=15.0,
+        headers=HEADERS,
+    )
+    await coordinator.resolve_markets()
     try:
         await coordinator._background_refresh("INJ", 30, "INJ_30")
         logger.info("Initial cache warmed.")
@@ -146,7 +258,11 @@ async def lifespan(app: FastAPI):
     await coordinator.client.aclose()
 
 
-app = FastAPI(title="QuantJect Institutional API", version="11.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="QuantJect Institutional API",
+    version="12.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,10 +285,21 @@ def root():
 
 
 @app.get("/v1/risk/volatility", response_model=RiskResponse)
-async def get_volatility(bg_tasks: BackgroundTasks, ticker="INJ", days=30):
+async def get_volatility(
+    bg_tasks: BackgroundTasks,
+    ticker: str = "INJ",
+    days: int = 30,
+):
     t0 = time.time()
 
-    closes, status = await coordinator.get_market_data(ticker, days, bg_tasks)
+    closes, status = await coordinator.get_market_data(
+        ticker,
+        days,
+        bg_tasks,
+    )
+
+    if len(closes) < 2:
+        raise HTTPException(502, "Insufficient market data")
 
     log_ret = np.diff(np.log(closes))
     vol = np.std(log_ret) * np.sqrt(365) * 100
