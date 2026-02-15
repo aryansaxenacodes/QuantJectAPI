@@ -17,7 +17,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantJect-Core")
 
+INJECTIVE_REST = "https://api.exchange.injective.network"
 COINGECKO = "https://api.coingecko.com/api/v3"
+
+MARKET_MAP = {
+    "INJ": "0xa508cb32923323679f29a032c70342c147c17d0145625922b0ef84e951c8440a",
+    "BTC": "0x4ca0f92fc28be0c9761326016b5a1a2177dd6375558365116b5bdda9abc229ce",
+    "ETH": "0x90e66cb9159ac39dc3692d43e2621db383d47f9a888c7a6e76860d7031201550",
+    "SOL": "0xd32398d57529452b4755a7114e9f5ee667954b60e6118db0d33e506691c9533f",
+}
 
 COIN_MAP = {
     "INJ": "injective-protocol",
@@ -26,10 +34,7 @@ COIN_MAP = {
     "SOL": "solana",
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 TTL_FRESH_SECONDS = 10
 TTL_SOFT_STALE_SECONDS = 45
@@ -37,18 +42,12 @@ TTL_SOFT_STALE_SECONDS = 45
 
 class DataCoordinator:
     def __init__(self):
-        self.cache: Dict[str, Dict[str, Any]] = {}
-        self.flights: Dict[str, asyncio.Event] = {}
+        self.cache = {}
+        self.flights = {}
         self.lock = asyncio.Lock()
-        self.client: httpx.AsyncClient | None = None
+        self.client = None
 
-    async def get_market_data(
-        self,
-        ticker: str,
-        days: int,
-        bg_tasks: BackgroundTasks,
-    ) -> Tuple[pd.Series, str]:
-
+    async def get_market_data(self, ticker, days, bg_tasks):
         key = f"{ticker}_{days}"
         now = time.time()
 
@@ -60,39 +59,25 @@ class DataCoordinator:
                 return entry["data"], "FRESH"
 
             if age < TTL_SOFT_STALE_SECONDS:
-                if not entry.get("updating", False):
+                if not entry.get("updating"):
                     entry["updating"] = True
-                    bg_tasks.add_task(
-                        self._background_refresh,
-                        ticker,
-                        days,
-                        key,
-                    )
+                    bg_tasks.add_task(self._background_refresh, ticker, days, key)
                 return entry["data"], "SOFT_STALE"
 
         if key in self.flights:
             await self.flights[key].wait()
-            if key in self.cache:
-                return self.cache[key]["data"], "COALESCED"
+            return self.cache[key]["data"], "COALESCED"
 
         self.flights[key] = asyncio.Event()
 
         try:
             data = await self._fetch_market_history(ticker, days)
-
             async with self.lock:
-                self.cache[key] = {
-                    "data": data,
-                    "ts": time.time(),
-                    "updating": False,
-                }
-
+                self.cache[key] = {"data": data, "ts": time.time(), "updating": False}
             return data, "NETWORK_FETCH"
-
         except Exception as e:
             logger.error(f"Fetch failed: {e}")
             raise HTTPException(502, "Injective data unavailable")
-
         finally:
             self.flights[key].set()
             del self.flights[key]
@@ -101,37 +86,44 @@ class DataCoordinator:
         try:
             data = await self._fetch_market_history(ticker, days)
             async with self.lock:
-                self.cache[key] = {
-                    "data": data,
-                    "ts": time.time(),
-                    "updating": False,
-                }
+                self.cache[key] = {"data": data, "ts": time.time(), "updating": False}
         except Exception:
             if key in self.cache:
                 self.cache[key]["updating"] = False
 
-    async def _fetch_market_history(self, ticker, days) -> pd.Series:
-        coin = COIN_MAP.get(ticker.upper(), "injective-protocol")
+    async def _fetch_injective_rest(self, ticker, days):
+        market_id = MARKET_MAP[ticker]
+        url = f"{INJECTIVE_REST}/api/exchange/v1/spot/markets/{market_id}/candles"
+        r = await self.client.get(url, params={"interval": "1d", "limit": days})
+        if r.status_code != 200:
+            raise IOError("injective rest failed")
+        data = r.json().get("data", [])
+        if not data:
+            raise IOError("empty candles")
+        closes = [float(c["close"]) for c in data]
+        return pd.Series(closes)
 
+    async def _fetch_coingecko(self, ticker, days):
+        coin = COIN_MAP[ticker]
         r = await self.client.get(
             f"{COINGECKO}/coins/{coin}/ohlc",
-            params={
-                "vs_currency": "usd",
-                "days": days,
-            },
+            params={"vs_currency": "usd", "days": days},
         )
-
         if r.status_code != 200:
-            raise IOError(f"CoinGecko error {r.status_code}")
-
+            raise IOError("coingecko failed")
         data = r.json()
-
-        if not data:
-            raise IOError("No market data")
-
         closes = [float(x[4]) for x in data]
-
         return pd.Series(closes)
+
+    async def _fetch_market_history(self, ticker, days):
+        ticker = ticker.upper()
+
+        try:
+            return await self._fetch_injective_rest(ticker, days)
+        except Exception:
+            logger.info("Injective REST failed, fallback CoinGecko")
+
+        return await self._fetch_coingecko(ticker, days)
 
 
 coordinator = DataCoordinator()
@@ -139,15 +131,12 @@ coordinator = DataCoordinator()
 
 async def startup_sequence():
     logger.info("Starting QuantJect...")
-    coordinator.client = httpx.AsyncClient(
-        timeout=15.0,
-        headers=HEADERS,
-    )
+    coordinator.client = httpx.AsyncClient(timeout=15.0, headers=HEADERS)
     try:
         await coordinator._background_refresh("INJ", 30, "INJ_30")
         logger.info("Initial cache warmed.")
     except Exception:
-        logger.info("Startup warming skipped.")
+        pass
 
 
 @asynccontextmanager
@@ -157,11 +146,7 @@ async def lifespan(app: FastAPI):
     await coordinator.client.aclose()
 
 
-app = FastAPI(
-    title="QuantJect Institutional API",
-    version="10.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="QuantJect Institutional API", version="11.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -184,21 +169,10 @@ def root():
 
 
 @app.get("/v1/risk/volatility", response_model=RiskResponse)
-async def get_volatility(
-    bg_tasks: BackgroundTasks,
-    ticker: str = "INJ",
-    days: int = 30,
-):
+async def get_volatility(bg_tasks: BackgroundTasks, ticker="INJ", days=30):
     t0 = time.time()
 
-    closes, status = await coordinator.get_market_data(
-        ticker,
-        days,
-        bg_tasks,
-    )
-
-    if len(closes) < 2:
-        raise HTTPException(502, "Insufficient market data")
+    closes, status = await coordinator.get_market_data(ticker, days, bg_tasks)
 
     log_ret = np.diff(np.log(closes))
     vol = np.std(log_ret) * np.sqrt(365) * 100
