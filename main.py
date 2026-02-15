@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger("QuantJect-Core")
 
 INJECTIVE_REST = "https://api.exchange.injective.network"
-LCD_INDEXER = "https://lcd.injective.network"
+INJECTIVE_LCD = "https://lcd.injective.network"
 COINGECKO = "https://api.coingecko.com/api/v3"
 
 CHRONOS_POOL = [
@@ -33,7 +33,10 @@ COIN_MAP = {
     "SOL": "solana",
 }
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+}
 
 TTL_FRESH_SECONDS = 10
 TTL_SOFT_STALE_SECONDS = 45
@@ -41,11 +44,11 @@ TTL_SOFT_STALE_SECONDS = 45
 
 class DataCoordinator:
     def __init__(self):
-        self.cache = {}
-        self.flights = {}
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.flights: Dict[str, asyncio.Event] = {}
         self.lock = asyncio.Lock()
-        self.client = None
-        self.market_map = {}
+        self.client: httpx.AsyncClient | None = None
+        self.market_map: Dict[str, str] = {}
 
     async def resolve_markets(self):
         try:
@@ -54,20 +57,35 @@ class DataCoordinator:
             )
             if r.status_code != 200:
                 return
+
             raw = r.json()
             markets = raw.get("markets", [])
-            for m in markets:
-                ticker = m.get("ticker", "")
-                market_id = m.get("marketId")
-                if not ticker or not market_id:
-                    continue
-                base = ticker.split("/")[0]
-                if base in ["INJ", "BTC", "ETH", "SOL"]:
-                    self.market_map[base] = market_id
-        except Exception:
-            pass
 
-    async def get_market_data(self, ticker, days, bg_tasks):
+            for m in markets:
+                market_id = m.get("marketId")
+                base_meta = m.get("baseTokenMeta", {})
+                symbol = base_meta.get("symbol")
+
+                if not symbol or not market_id:
+                    continue
+
+                symbol = symbol.upper()
+
+                if symbol in ["INJ", "BTC", "ETH", "SOL"]:
+                    self.market_map[symbol] = market_id
+
+            logger.info(f"Resolved markets: {self.market_map}")
+
+        except Exception as e:
+            logger.info(f"Market resolve failed: {e}")
+
+    async def get_market_data(
+        self,
+        ticker: str,
+        days: int,
+        bg_tasks: BackgroundTasks,
+    ) -> Tuple[pd.Series, str]:
+
         key = f"{ticker}_{days}"
         now = time.time()
 
@@ -79,29 +97,39 @@ class DataCoordinator:
                 return entry["data"], "FRESH"
 
             if age < TTL_SOFT_STALE_SECONDS:
-                if not entry.get("updating"):
+                if not entry.get("updating", False):
                     entry["updating"] = True
-                    bg_tasks.add_task(self._background_refresh, ticker, days, key)
+                    bg_tasks.add_task(
+                        self._background_refresh,
+                        ticker,
+                        days,
+                        key,
+                    )
                 return entry["data"], "SOFT_STALE"
 
         if key in self.flights:
             await self.flights[key].wait()
-            return self.cache[key]["data"], "COALESCED"
+            if key in self.cache:
+                return self.cache[key]["data"], "COALESCED"
 
         self.flights[key] = asyncio.Event()
 
         try:
             data = await self._fetch_market_history(ticker, days)
+
             async with self.lock:
                 self.cache[key] = {
                     "data": data,
                     "ts": time.time(),
                     "updating": False,
                 }
+
             return data, "NETWORK_FETCH"
+
         except Exception as e:
             logger.error(f"Fetch failed: {e}")
             raise HTTPException(502, "Injective data unavailable")
+
         finally:
             self.flights[key].set()
             del self.flights[key]
@@ -120,9 +148,9 @@ class DataCoordinator:
                 self.cache[key]["updating"] = False
 
     async def _layer_exchange_rest(self, ticker, days):
-        market_id = self.market_map.get(ticker)
+        market_id = self.market_map.get(ticker.upper())
         if not market_id:
-            raise IOError("market not resolved")
+            raise IOError("No resolved market id")
 
         r = await self.client.get(
             f"{INJECTIVE_REST}/api/exchange/v1/spot/markets/{market_id}/candles",
@@ -130,45 +158,46 @@ class DataCoordinator:
         )
 
         if r.status_code != 200:
-            raise IOError("exchange rest failed")
+            raise IOError("Injective REST failed")
 
         raw = r.json()
-        candles = raw.get("candles", []) or raw.get("data", [])
+        candles = raw.get("candles") or raw.get("data") or []
 
         if not candles:
-            raise IOError("empty candles")
+            raise IOError("Empty candles")
 
         closes = [float(x["close"]) for x in candles]
         return pd.Series(closes)
 
     async def _layer_lcd(self, ticker, days):
-        market_id = self.market_map.get(ticker)
+        market_id = self.market_map.get(ticker.upper())
         if not market_id:
-            raise IOError("market not resolved")
+            raise IOError("No market id for lcd")
 
         r = await self.client.get(
-            f"{LCD_INDEXER}/injective/exchange/v1beta1/spot/markets/{market_id}/candles"
+            f"{INJECTIVE_LCD}/injective/exchange/v1beta1/spot/markets/{market_id}/candles",
+            params={"interval": "1d", "limit": days},
         )
 
         if r.status_code != 200:
-            raise IOError("lcd failed")
+            raise IOError("Injective LCD failed")
 
         raw = r.json()
         candles = raw.get("candles", [])
 
         if not candles:
-            raise IOError("empty lcd")
+            raise IOError("LCD empty")
 
-        closes = [float(x["close"]) for x in candles][-days:]
+        closes = [float(x["close"]) for x in candles]
         return pd.Series(closes)
 
     async def _layer_chronos(self, ticker, days):
-        market_id = self.market_map.get(ticker)
+        market_id = self.market_map.get(ticker.upper())
         if not market_id:
-            raise IOError("market not resolved")
+            raise IOError("No market id for chronos")
 
         end_time = int(time.time())
-        start_time = end_time - days * 86400
+        start_time = end_time - (days * 86400)
 
         params = {
             "marketID": market_id,
@@ -182,6 +211,7 @@ class DataCoordinator:
                 f"{node}/api/chronos/v1/market/history",
                 params=params,
             )
+
             if r.status_code != 200:
                 continue
 
@@ -194,7 +224,7 @@ class DataCoordinator:
             closes = [float(x["c"]) for x in hist]
             return pd.Series(closes)
 
-        raise IOError("chronos failed")
+        raise IOError("Chronos failed")
 
     async def _layer_coingecko(self, ticker, days):
         coin = COIN_MAP.get(ticker.upper(), "injective-protocol")
@@ -205,13 +235,14 @@ class DataCoordinator:
         )
 
         if r.status_code != 200:
-            raise IOError("coingecko failed")
+            raise IOError("CoinGecko failed")
 
-        raw = r.json()
-        if not raw:
-            raise IOError("empty coingecko")
+        data = r.json()
 
-        closes = [float(x[4]) for x in raw]
+        if not data:
+            raise IOError("CoinGecko empty")
+
+        closes = [float(x[4]) for x in data]
         return pd.Series(closes)
 
     async def _fetch_market_history(self, ticker, days):
@@ -248,7 +279,7 @@ async def startup_sequence():
         await coordinator._background_refresh("INJ", 30, "INJ_30")
         logger.info("Initial cache warmed.")
     except Exception:
-        pass
+        logger.info("Startup warming skipped.")
 
 
 @asynccontextmanager
@@ -260,7 +291,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantJect Institutional API",
-    version="12.0.0",
+    version="FINAL",
     lifespan=lifespan,
 )
 
