@@ -17,7 +17,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantJect-Core")
 
-REST_NODE = "https://api.exchange.injective.network"
+COINGECKO = "https://api.coingecko.com/api/v3"
+
+COIN_MAP = {
+    "INJ": "injective-protocol",
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -34,22 +41,6 @@ class DataCoordinator:
         self.flights: Dict[str, asyncio.Event] = {}
         self.lock = asyncio.Lock()
         self.client: httpx.AsyncClient | None = None
-
-    async def _resolve_market_id(self, ticker: str) -> str:
-        r = await self.client.get(
-            f"{REST_NODE}/api/exchange/v1/spot/markets"
-        )
-        if r.status_code != 200:
-            raise IOError("Failed to fetch markets")
-
-        markets = r.json().get("markets", [])
-        t = ticker.upper()
-
-        for m in markets:
-            if m.get("ticker", "").upper().startswith(t):
-                return m["marketId"]
-
-        raise IOError("Market not found")
 
     async def get_market_data(
         self,
@@ -115,33 +106,30 @@ class DataCoordinator:
                     "ts": time.time(),
                     "updating": False,
                 }
-            logger.info(f"Background refresh success: {ticker}")
         except Exception:
             if key in self.cache:
                 self.cache[key]["updating"] = False
 
     async def _fetch_market_history(self, ticker, days) -> pd.Series:
-        market_id = await self._resolve_market_id(ticker)
-
-        url = f"{REST_NODE}/api/exchange/v1/spot/markets/{market_id}/candles"
+        coin = COIN_MAP.get(ticker.upper(), "injective-protocol")
 
         r = await self.client.get(
-            url,
+            f"{COINGECKO}/coins/{coin}/ohlc",
             params={
-                "interval": "1d",
-                "limit": days,
+                "vs_currency": "usd",
+                "days": days,
             },
         )
 
         if r.status_code != 200:
-            raise IOError(f"REST error {r.status_code}")
+            raise IOError(f"CoinGecko error {r.status_code}")
 
-        candles = r.json().get("data", [])
+        data = r.json()
 
-        if not candles:
-            raise IOError("No candles")
+        if not data:
+            raise IOError("No market data")
 
-        closes = [float(c["close"]) for c in candles]
+        closes = [float(x[4]) for x in data]
 
         return pd.Series(closes)
 
@@ -171,7 +159,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantJect Institutional API",
-    version="9.0.0",
+    version="10.0.0",
     lifespan=lifespan,
 )
 
